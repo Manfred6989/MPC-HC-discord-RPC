@@ -1,0 +1,12 @@
+{
+  "discord_client_id": "PUT_YOUR_DISCORD_APPLICATION_ID_HERE",
+  "mpc_host": "127.0.0.1",
+  "mpc_port": 13579,
+  "poll_interval": 2.0,
+  "large_image": "mpc-hc",
+  "large_text": "MPC-HC",
+  "show_filename": true,
+  "strip_extension": true,
+  "hide_when_paused": false,
+  "hide_when_stopped": true
+}
