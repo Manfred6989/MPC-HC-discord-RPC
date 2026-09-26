@@ -16,6 +16,7 @@ import logging
 import os
 import re
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -178,49 +179,100 @@ def needs_update(prev: dict | None, new: dict | None) -> bool:
     return False
 
 
+class ConfigError(Exception):
+    pass
+
+
 def load_config(path: Path) -> dict:
+    """Load config.json; create it from config.example.json if missing."""
+    if not path.exists():
+        example = path.with_name("config.example.json")
+        if example.exists():
+            path.write_text(example.read_text(encoding="utf-8"), encoding="utf-8")
+            log.info("Created %s from config.example.json", path)
     cfg = dict(DEFAULT_CONFIG)
     if path.exists():
-        with path.open(encoding="utf-8") as f:
-            cfg.update(json.load(f))
-    else:
-        log.warning("Config %s not found, using defaults.", path)
+        try:
+            with path.open(encoding="utf-8-sig") as f:
+                cfg.update(json.load(f))
+        except (OSError, ValueError) as e:
+            raise ConfigError(f"Can't read {path.name}: {e}") from e
     env_id = os.environ.get("MPC_DISCORD_CLIENT_ID")
     if env_id:
         cfg["discord_client_id"] = env_id
+    cfg["discord_client_id"] = str(cfg["discord_client_id"]).strip()
+    if not cfg["discord_client_id"].isdigit():
+        raise ConfigError(f"Set discord_client_id in {path.name} (see README)")
     return cfg
+
+
+def _describe(err: Exception) -> str:
+    """Short human-readable reason for a pypresence / IPC error."""
+    name = type(err).__name__
+    hints = {
+        "DiscordNotFound": "Discord desktop app not running",
+        "InvalidPipe": "Discord IPC pipe not usable",
+        "InvalidID": "Discord rejected the Application ID",
+        "ConnectionTimeout": "timed out connecting to Discord",
+        "ResponseTimeout": "Discord did not answer",
+        "PipeClosed": "Discord closed the connection",
+    }
+    msg = hints.get(name)
+    if msg:
+        return msg
+    text = str(err).strip()
+    return f"{name}: {text}" if text else name
 
 
 class DiscordPresence:
     """Thin wrapper around pypresence that reconnects on failure."""
 
+    RETRY_INTERVAL = 10.0
+
     def __init__(self, client_id: str):
         self.client_id = client_id
         self.rpc = None
+        self.error: str | None = None
+        self.fatal = False  # Discord actively refused (bad ID / bad activity), not just absent
+        self._next_try = 0.0
 
-    def _connect(self) -> bool:
+    @property
+    def connected(self) -> bool:
+        return self.rpc is not None
+
+    def ensure_connected(self) -> bool:
+        if self.rpc is not None:
+            return True
+        if time.monotonic() < self._next_try:
+            return False
+        self._next_try = time.monotonic() + self.RETRY_INTERVAL
         from pypresence import Presence
 
         try:
             rpc = Presence(self.client_id)
             rpc.connect()
-        except Exception as e:  # DiscordNotFound, InvalidPipe, timeouts, ...
-            log.debug("Discord connect failed: %s", e)
+        except Exception as e:
+            self._set_error(e)
+            log.debug("Discord connect failed: %r", e)
             return False
         self.rpc = rpc
+        self.error, self.fatal = None, False
         log.info("Connected to Discord.")
         return True
 
-    def ensure_connected(self) -> bool:
-        return self.rpc is not None or self._connect()
+    def _set_error(self, err: Exception) -> None:
+        self.error = _describe(err)
+        self.fatal = type(err).__name__ in ("InvalidID", "ServerError", "DiscordError")
 
     def _drop(self, err: Exception) -> None:
-        log.warning("Lost connection to Discord (%s); will retry.", err)
+        self._set_error(err)
+        log.warning("Discord error (%r); reconnecting.", err)
         try:
             self.rpc.close()
         except Exception:
             pass
         self.rpc = None
+        self._next_try = 0.0
 
     def update(self, activity: dict) -> bool:
         from pypresence import ActivityType, StatusDisplayType
@@ -233,6 +285,7 @@ class DiscordPresence:
                 status_display_type=StatusDisplayType.DETAILS,
                 **{k: v for k, v in activity.items() if v is not None},
             )
+            self.error, self.fatal = None, False
             return True
         except Exception as e:
             self._drop(e)
@@ -258,65 +311,310 @@ class DiscordPresence:
             self.rpc = None
 
 
-def run(cfg: dict) -> None:
-    client_id = str(cfg["discord_client_id"]).strip()
-    if not client_id.isdigit():
-        sys.exit(
-            "discord_client_id is not set. Create an application at "
-            "https://discord.com/developers/applications and put its "
-            "Application ID in config.json (see README)."
-        )
+@dataclass
+class AppStatus:
+    """What the tray (or console) shows. level: ok | idle | error."""
 
-    discord = DiscordPresence(client_id)
-    interval = max(float(cfg["poll_interval"]), 0.5)
-    sent: dict | None = None  # what Discord currently shows
-    last_push = float("-inf")
-    mpc_was_up = None
+    level: str = "idle"
+    mpc: str = "MPC-HC: checking..."
+    discord: str = "Discord: checking..."
+    presence: str = "Presence: none"
+    problem: str | None = None
 
-    log.info("Watching MPC-HC at http://%s:%s/ ...", cfg["mpc_host"], cfg["mpc_port"])
+
+class Worker:
+    """Polling loop. Runs in the main thread (console) or a background thread (tray)."""
+
+    def __init__(self, config_path: Path, on_status=None):
+        self.config_path = config_path
+        self.on_status = on_status or (lambda st: None)
+        self.stop_event = threading.Event()
+        self.paused = False  # user toggle from the tray menu
+        self.status = AppStatus()
+        self._cfg: dict | None = None
+        self._cfg_mtime: float | None = None
+        self._discord: DiscordPresence | None = None
+
+    def stop(self) -> None:
+        self.stop_event.set()
+
+    def _publish(self, st: AppStatus) -> None:
+        if st != self.status:
+            self.status = st
+            if st.problem:
+                log.info("Status: %s", st.problem)
+            self.on_status(st)
+
+    def _reload_config(self) -> str | None:
+        """(Re)load config when the file changes. Returns an error message or None."""
+        try:
+            mtime = self.config_path.stat().st_mtime
+        except OSError:
+            mtime = None
+        if self._cfg is not None and mtime == self._cfg_mtime:
+            return None
+        self._cfg_mtime = mtime
+        try:
+            cfg = load_config(self.config_path)
+        except ConfigError as e:
+            self._cfg = None
+            if self._discord:
+                self._discord.close()
+                self._discord = None
+            return str(e)
+        if self._discord is None or self._discord.client_id != cfg["discord_client_id"]:
+            if self._discord:
+                self._discord.close()
+            self._discord = DiscordPresence(cfg["discord_client_id"])
+        self._cfg = cfg
+        log.info("Config loaded; watching MPC-HC at http://%s:%s/", cfg["mpc_host"], cfg["mpc_port"])
+        return None
+
+    def run(self) -> None:
+        sent: dict | None = None  # what Discord currently shows
+        last_push = float("-inf")
+        try:
+            while not self.stop_event.is_set():
+                err = self._reload_config()
+                if err:
+                    self._publish(AppStatus("error", "MPC-HC: -", "Discord: -", "Presence: none", err))
+                    sent = None
+                    self.stop_event.wait(2.0)
+                    continue
+                cfg, discord = self._cfg, self._discord
+
+                status = fetch_status(cfg["mpc_host"], int(cfg["mpc_port"]))
+                activity = build_activity(status, cfg) if status and not self.paused else None
+                discord.ensure_connected()
+
+                now = time.monotonic()
+                changed = needs_update(sent, activity)
+                stale = activity is not None and now - last_push >= REFRESH_INTERVAL
+                if discord.connected and (changed or stale) and now - last_push >= MIN_UPDATE_INTERVAL:
+                    ok = discord.update(activity) if activity else discord.clear()
+                    if ok:
+                        sent = activity
+                        last_push = now
+                        if changed:
+                            log.info("Presence: %s", f"{activity['details']} - {activity['state']}" if activity else "cleared")
+                if not discord.connected:
+                    sent = None  # Discord shows nothing; resend once reconnected
+
+                self._publish(self._make_status(status, activity, sent, discord))
+                self.stop_event.wait(max(float(cfg["poll_interval"]), 0.5))
+        except Exception as e:
+            log.exception("Worker crashed")
+            self._publish(AppStatus("error", "MPC-HC: -", "Discord: -", "Presence: none", f"Crashed: {e!r}"))
+            raise
+        finally:
+            if self._discord:
+                self._discord.close()
+
+    def _make_status(self, status, activity, sent, discord) -> AppStatus:
+        if status is None:
+            mpc = "MPC-HC: not reachable"
+            problem = (f"MPC-HC not reachable on port {self._cfg['mpc_port']} "
+                       "(not running, or web interface off)")
+        else:
+            mpc = "MPC-HC: " + {STATE_PLAYING: "playing", STATE_PAUSED: "paused",
+                                STATE_STOPPED: "stopped"}.get(status.state, "no file")
+            problem = None
+        if discord.connected:
+            dc = "Discord: connected"
+        else:
+            dc = f"Discord: {discord.error or 'not connected'}"
+            problem = problem or dc
+        if self.paused:
+            pres = "Presence: paused by you"
+        elif sent:
+            pres = f"Presence: {sent['details']} - {sent['state']}"
+        elif activity:
+            pres = "Presence: waiting to send"
+        else:
+            pres = "Presence: none"
+        if discord.error and discord.fatal:
+            dc = f"Discord: {discord.error}"
+            problem = dc
+            level = "error"
+        else:
+            level = "ok" if sent else "idle"
+        return AppStatus(level, mpc, dc, pres, problem)
+
+
+# ---------------------------------------------------------------------------
+# Tray UI (Windows system tray via pystray; also works on Linux/macOS)
+# ---------------------------------------------------------------------------
+
+LEVEL_COLORS = {"ok": (67, 181, 129), "idle": (250, 166, 26), "error": (240, 71, 71)}
+
+
+def make_icon_image(level: str):
+    from PIL import Image, ImageDraw
+
+    size = 64
+    img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    d.rounded_rectangle((2, 2, size - 3, size - 3), radius=14, fill=(40, 43, 48))
+    d.polygon([(14, 10), (14, 42), (40, 26)], fill=(255, 255, 255))  # play symbol
+    c = LEVEL_COLORS.get(level, LEVEL_COLORS["idle"])
+    d.ellipse((28, 28, 63, 63), fill=c, outline=(40, 43, 48), width=4)  # status dot
+    return img
+
+
+def open_path(path: Path) -> None:
+    if sys.platform == "win32":
+        os.startfile(path)  # noqa: S606 - opens with the user's default app
+    else:
+        import subprocess
+
+        subprocess.Popen(["open" if sys.platform == "darwin" else "xdg-open", str(path)])
+
+
+def tray_title(st: AppStatus) -> str:
+    lines = ["MPC-HC Discord RPC", st.presence if st.level == "ok" else (st.problem or st.presence)]
+    return "\n".join(lines)[:127]  # Windows tooltip limit
+
+
+def run_tray(worker: Worker, log_path: Path | None) -> None:
+    import pystray
+    from pystray import Menu, MenuItem as Item
+
+    def refresh(st: AppStatus) -> None:
+        icon.icon = make_icon_image(st.level)
+        icon.title = tray_title(st)
+        icon.update_menu()
+
+    def toggle_pause(icon_, item) -> None:
+        worker.paused = not worker.paused
+
+    def quit_(icon_, item) -> None:
+        worker.stop()
+        icon.stop()
+
+    menu = Menu(
+        Item(lambda i: worker.status.mpc, None, enabled=False),
+        Item(lambda i: worker.status.discord, None, enabled=False),
+        Item(lambda i: worker.status.presence[:100], None, enabled=False),
+        Item(lambda i: f"Problem: {worker.status.problem}"[:100], None, enabled=False,
+             visible=lambda i: bool(worker.status.problem)),
+        Menu.SEPARATOR,
+        Item("Pause presence", toggle_pause, checked=lambda i: worker.paused),
+        Item("Open config", lambda *_: open_path(worker.config_path)),
+        Item("Open log", lambda *_: open_path(log_path), visible=log_path is not None),
+        Menu.SEPARATOR,
+        Item("Quit", quit_),
+    )
+    icon = pystray.Icon("mpc-discord-rpc", make_icon_image("idle"), tray_title(worker.status), menu)
+    worker.on_status = refresh
+
+    thread = threading.Thread(target=worker.run, name="worker", daemon=True)
+
+    def setup(icon_) -> None:
+        icon_.visible = True
+        thread.start()
+
+    icon.run(setup=setup)
+    worker.stop()
+    thread.join(timeout=5)  # let it clear the presence
+
+
+# ---------------------------------------------------------------------------
+# Diagnostics
+# ---------------------------------------------------------------------------
+
+def run_check(config_path: Path) -> int:
+    """Step-by-step self test, printed to the console. Returns an exit code."""
+    def say(ok, msg):
+        print(f"[{'OK' if ok else 'FAIL'}] {msg}")
+        return ok
+
+    print(f"Python {sys.version.split()[0]} on {sys.platform}")
     try:
-        while True:
-            status = fetch_status(cfg["mpc_host"], int(cfg["mpc_port"]))
-            if (status is not None) != mpc_was_up:
-                mpc_was_up = status is not None
-                log.info("MPC-HC %s.", "detected" if mpc_was_up else "not reachable (is the web interface enabled?)")
+        import pypresence
+        say(True, f"pypresence {pypresence.__version__} installed")
+    except ImportError:
+        say(False, "pypresence not installed: run  pip install -r requirements.txt")
+        return 1
+    try:
+        cfg = load_config(config_path)
+        say(True, f"config {config_path} (client id {cfg['discord_client_id']})")
+    except ConfigError as e:
+        say(False, str(e))
+        return 1
 
-            activity = build_activity(status, cfg) if status else None
-            now = time.monotonic()
+    url = f"http://{cfg['mpc_host']}:{cfg['mpc_port']}/variables.html"
+    st = fetch_status(cfg["mpc_host"], int(cfg["mpc_port"]))
+    if not say(st is not None, f"MPC-HC web interface at {url}"):
+        print("       Enable it: MPC-HC > View > Options > Player > Web Interface > 'Listen on port'.")
+    elif st.state == STATE_NONE:
+        print("       MPC-HC is running but no file is open.")
+    else:
+        print(f"       file={st.file!r} state={st.state} pos={st.position_ms}ms dur={st.duration_ms}ms")
 
-            changed = needs_update(sent, activity)
-            stale = activity is not None and now - last_push >= REFRESH_INTERVAL
-            if (changed or stale) and now - last_push >= MIN_UPDATE_INTERVAL:
-                ok = discord.update(activity) if activity else discord.clear()
-                if ok:
-                    sent = activity
-                    last_push = now
-                    if changed:
-                        log.info("Presence: %s", f"{activity['details']} - {activity['state']}" if activity else "cleared")
-                elif activity:
-                    sent = None  # retry on the next poll
-            time.sleep(interval)
-    except KeyboardInterrupt:
-        pass
-    finally:
-        discord.close()
+    from pypresence.utils import get_ipc_path
+    pipe = get_ipc_path()
+    if not say(pipe is not None, f"Discord IPC pipe {pipe or '(none found)'}"):
+        print("       Start the Discord desktop app (the browser version has no IPC).")
+        return 1
+
+    d = DiscordPresence(cfg["discord_client_id"])
+    if not say(d.ensure_connected(), f"Discord handshake{'' if d.connected else ': ' + str(d.error)}"):
+        return 1
+    test = (build_activity(st, cfg) if st else None) or {
+        "details": "Test from mpc_discord_rpc --check", "state": "Testing",
+        "large_image": cfg["large_image"] or None, "large_text": cfg["large_text"] or None}
+    ok = say(d.update(test), f"Set activity{'' if d.connected else ': ' + str(d.error)}")
+    if ok:
+        print("       Check your Discord profile now; clearing in 10 s...")
+        time.sleep(10)
+        print("       Not visible? Discord > User Settings > Activity Privacy >")
+        print("       'Share your detected activities with others' must be on.")
+    d.close()
+    return 0 if ok else 1
 
 
 def main() -> None:
-    here = Path(getattr(sys, "frozen", False) and sys.executable or __file__).resolve().parent
+    here = Path(sys.executable if getattr(sys, "frozen", False) else __file__).resolve().parent
     p = argparse.ArgumentParser(description="Discord Rich Presence for MPC-HC")
     p.add_argument("-c", "--config", type=Path, default=here / "config.json")
     p.add_argument("-v", "--verbose", action="store_true")
-    p.add_argument("--log-file", type=Path, help="log to this file (useful with pythonw, which has no console)")
+    p.add_argument("--log-file", type=Path, help="log file (tray mode default: mpc_discord_rpc.log next to the script)")
+    p.add_argument("--no-tray", action="store_true", help="run in the console without a tray icon")
+    p.add_argument("--check", action="store_true", help="run a step-by-step self test and exit")
     args = p.parse_args()
 
+    tray = not (args.no_tray or args.check)
+    no_console = sys.stderr is None  # pythonw / frozen windowed exe
+    log_file = args.log_file or (here / "mpc_discord_rpc.log" if tray or no_console else None)
+    handlers = []
+    if log_file:
+        from logging.handlers import RotatingFileHandler
+        handlers.append(RotatingFileHandler(log_file, maxBytes=512_000, backupCount=1, encoding="utf-8"))
+    if not no_console:
+        handlers.append(logging.StreamHandler())
     logging.basicConfig(
-        filename=args.log_file,
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(asctime)s %(levelname)s %(message)s",
-        datefmt="%H:%M:%S",
+        datefmt="%Y-%m-%d %H:%M:%S",
+        handlers=handlers,
     )
-    run(load_config(args.config))
+
+    if args.check:
+        sys.exit(run_check(args.config))
+
+    worker = Worker(args.config)
+    if tray:
+        try:
+            run_tray(worker, log_file)
+            return
+        except Exception:
+            log.exception("Tray icon unavailable; running without it.")
+            if no_console:
+                raise
+    try:
+        worker.run()
+    except KeyboardInterrupt:
+        pass
 
 
 if __name__ == "__main__":

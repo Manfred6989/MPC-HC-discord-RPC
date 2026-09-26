@@ -21,22 +21,42 @@ and sends the result to the Discord desktop app over its local IPC pipe
    - Optional, for the icon: *Rich Presence → Art Assets* → upload an MPC-HC logo and name it `mpc-hc`.
      (Newly uploaded assets can take a few minutes to show up.)
 
-3. **Install Python 3.10+** from <https://www.python.org/downloads/> (tick "Add python.exe to PATH"), then in this folder:
+3. **Install Python 3.9+** from <https://www.python.org/downloads/> (tick "Add python.exe to PATH"), then in this folder:
    ```
    pip install -r requirements.txt
-   copy config.example.json config.json
    ```
-   Edit `config.json` and set `discord_client_id` to your Application ID.
 
-4. **Run it**
-   ```
-   python mpc_discord_rpc.py
-   ```
-   Or double-click `run_hidden.bat` to run it without a console window (logs go to `mpc_discord_rpc.log`).
+4. **Run it**: double-click `run_hidden.bat` (no console window), or run `python mpc_discord_rpc.py`.
+   The first run creates `config.json` and the tray icon turns red with
+   "Set discord_client_id in config.json". Right-click the tray icon → **Open config**,
+   paste your Application ID, and save. The change is picked up automatically, with no restart needed.
    To start with Windows: press `Win+R`, type `shell:startup`, and put a shortcut to `run_hidden.bat` there.
 
 Discord must be the **desktop app** (the browser version has no IPC pipe), and
-*User Settings → Activity Privacy → Share your detected activities* must be on.
+*User Settings → Activity Privacy → Share your detected activities with others* must be on.
+
+## Tray icon
+
+The dot on the icon shows the status. Hover over the icon for a summary, or right-click it for details:
+
+| Dot | Meaning |
+|---|---|
+| 🟢 green | Your presence is showing in Discord. |
+| 🟠 orange | Waiting: MPC-HC or Discord isn't running, no file is open, or you paused it. The menu says which. |
+| 🔴 red | Something needs fixing: missing or invalid config, Discord rejected the Application ID or the activity, or a crash. |
+
+The right-click menu shows the MPC-HC, Discord and presence status lines, and has
+**Pause presence**, **Open config**, **Open log**, and **Quit**.
+
+## It doesn't work?
+
+Run the self test from a console in this folder:
+```
+python mpc_discord_rpc.py --check
+```
+It checks, one step at a time: the installed packages → config → MPC-HC web interface → Discord pipe →
+handshake → setting a test activity. It prints what to fix at the first step that fails.
+The log is in `mpc_discord_rpc.log` (tray menu → **Open log**).
 
 ## Configuration (`config.json`)
 
@@ -57,7 +77,7 @@ Discord must be the **desktop app** (the browser version has no IPC pipe), and
 - Discord rate-limits presence updates, so changes (pause, seek, next file) are pushed at most
   every 5 s. Normal playback doesn't need updates: Discord runs the progress bar itself.
 - Playback speed is taken into account for the progress bar.
-- Command line: `-c path\to\config.json`, `-v` for debug logging, `--log-file FILE`.
+- Command line: `-c path\to\config.json`, `-v` for debug logging, `--log-file FILE`, `--no-tray` to run in the console only, `--check` for the self test.
 - Should also work with MPC-BE, which has a compatible web interface, but that's untested.
 
 ## Tests

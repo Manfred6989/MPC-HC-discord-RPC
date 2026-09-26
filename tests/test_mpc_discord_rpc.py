@@ -1,4 +1,7 @@
+import json
+import tempfile
 import unittest
+from pathlib import Path
 
 import mpc_discord_rpc as m
 
@@ -67,6 +70,38 @@ class ActivityTests(unittest.TestCase):
         self.assertTrue(m.needs_update(a, m.build_activity(status(state=1), CFG)))
         self.assertTrue(m.needs_update(a, None))
         self.assertFalse(m.needs_update(None, None))
+
+
+class ConfigTests(unittest.TestCase):
+    def test_missing_id_is_error(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d, "config.json")
+            p.write_text(json.dumps({"discord_client_id": "PUT_YOUR_ID_HERE"}))
+            with self.assertRaises(m.ConfigError):
+                m.load_config(p)
+
+    def test_created_from_example_and_bom_ok(self):
+        with tempfile.TemporaryDirectory() as d:
+            Path(d, "config.example.json").write_text('\ufeff{"discord_client_id": 123}', encoding="utf-8")
+            cfg = m.load_config(Path(d, "config.json"))
+            self.assertEqual(cfg["discord_client_id"], "123")
+            self.assertTrue(Path(d, "config.json").exists())
+
+    def test_bad_json(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d, "config.json")
+            p.write_text("{nope")
+            with self.assertRaises(m.ConfigError):
+                m.load_config(p)
+
+
+class TrayTests(unittest.TestCase):
+    def test_title_limit(self):
+        st = m.AppStatus("ok", presence="Presence: " + "x" * 300)
+        self.assertLessEqual(len(m.tray_title(st)), 127)
+
+    def test_icon(self):
+        self.assertEqual(m.make_icon_image("error").size, (64, 64))
 
 
 if __name__ == "__main__":
